@@ -2,11 +2,131 @@
 from __future__ import division
 import os
 import time
+import sys
+import logging
 import tensorflow as tf
 import numpy as np
+from sklearn.cluster import KMeans
+from tensorflow.python.layers.base import Layer, InputSpec
 
 from ops import *
 from utils import *
+
+def cluster_layer(inputs, n_clusters, weights=None, alpha=1.0, **kwargs):
+    """Create a new clustering layer and apply it to the `inputs` tensor."""
+    layer = ClusteringLayer(n_clusters, weights=weights, alpha=alpha, **kwargs)
+    return layer.apply(inputs)
+
+
+class ClusteringLayer(Layer):
+    """
+    Define a layer to calculate soft targets via Student's t-distribution.
+
+    Input to this layer must be 2D.
+    Output is a 2D tensor with shape: (None, k)
+    """
+
+    def __init__(self, k, weights=None, alpha=1.0, **kwargs):
+        """Save all relevant variables needed to build the layer."""
+        super(ClusteringLayer, self).__init__(**kwargs)
+        self.k = k
+        self.alpha = alpha
+        self.initialize_with_weights = weights
+
+        # Define an InputSpec for our layer; we don't know shape of input yet,
+        # but we know it has to be 2D.
+        self.input_spec = InputSpec(ndim=2)
+
+    def build(self, input_shape):
+        """
+        Construct the (tensor) variables for the layer.
+        This is (automatically) called a single time before the first call().
+        """
+
+        if input_shape[1].value is None or len(input_shape) != 2:
+            raise ValueError('The 2nd (and last) dimension of the inputs to '
+                             '`ClusteringLayer` should be defined. Found `None`.')
+
+        # Redefine the InputSpec now that we have shape information
+        self.input_spec = InputSpec(dtype=tf.float32, shape=(None, input_shape[1]))
+
+        # Create the tensorflow variable for the trainable params of the layer
+        # i.e. the weights for the similarities between embedded points and
+        # cluster centroids (as measured by Student's t-distribution)
+        self.clusters = self.add_variable(
+            name='clusters',
+            shape=[self.k, input_shape[1]],
+            initializer=tf.contrib.layers.xavier_initializer(),
+            dtype=self.dtype,
+            trainable=True)
+
+        # If weights were provided to the constructor, load them
+        if self.initialize_with_weights is not None:
+            self.clusters = tf.assign(self.clusters, self.initialize_with_weights)
+            del self.initialize_with_weights
+
+        # We must assign self.built = True for tensorflow to use the layer
+        self.built = True
+
+    def call(self, inputs, **kwargs):
+        """
+        Compute soft targets q_ij via Sudent's t-distribution.
+
+        Here we compute the numerator of equation (1) for q_ij, then normalize
+        by dividing by the total sum over all vectors in the numerator.
+        :param inputs:
+        """
+
+        # We use axis arg to norm so that the tensor is treated as a batch of vectors.
+        num = (1.0 + tf.norm((tf.expand_dims(inputs, axis=1) - self.clusters), axis=2) / self.alpha)
+        num **= -((self.alpha + 1.0) / 2.0)
+        return num / tf.reduce_sum(num)
+
+    def compute_output_shape(self, input_shape):
+        """Show output shape as (?, k)."""
+        assert input_shape and len(input_shape) == 2
+        return input_shape[0], self.k
+
+def target_distribution(q):
+    """Compute the target distribution p, based on q."""
+    # q in this form is a numpy array, i.e. not symbolic
+    weight = q ** 2 / q.sum(axis=0)
+    return (weight.T / weight.sum(axis=1)).T
+
+
+def load_autoencoder_weights(sess, saver):
+    """
+    Initialize all variables in the session, then restore the weights of the
+    autoencoder.
+    """
+    AE_LOGDIR = os.path.join(os.path.dirname(__file__), "autoencoder_logdir")
+
+    # Create a saver and session, then init all variables
+    sess.run(tf.global_variables_initializer())
+
+    logging.info("Attempting to restore pretrained AE weights")
+    # Restore the pretrained weights of the AE
+    ckpt = tf.train.get_checkpoint_state(AE_LOGDIR)
+    if ckpt and ckpt.model_checkpoint_path:
+        saver.restore(sess, ckpt.model_checkpoint_path)
+        logging.info("Successfully restored AE weights")
+    else:
+        logging.error("Unable to restore pretrained AE weights; terminating")
+        sys.exit(1)
+
+
+def encode_samples(samples, input_tensor, encode_fn, sess, saver):
+    """
+    Given a 4D tensor of samples, encode the tensor with encode_fn after
+    loading the autoencoder weights.
+    """
+
+    load_autoencoder_weights(sess, saver)
+
+    logging.info("Encoding samples into latent feature space Z")
+    Z = sess.run(encode_fn, feed_dict={input_tensor: samples})
+
+    return Z
 
 class BEGAN(object):
     model_name = "BEGAN"     # name for checkpoint
@@ -42,14 +162,14 @@ class BEGAN(object):
             self.sample_num = 64  # number of generated images to be saved
 
             # load mnist
-            self.data_X, self.data_y = load_mnist(self.dataset_name)
+            self.data_X, self.data_y = load_mnist()
 
             # get number of batches for a single epoch
             self.num_batches = len(self.data_X) // self.batch_size
         else:
             raise NotImplementedError
 
-    def discriminator(self, x, is_training=True, reuse=False):
+    def discriminator(self, x, sess, saver,  is_training=True, reuse=False):
         # It must be Auto-Encoder style architecture
         # Architecture : (64)4c2s-FC32_BR-FC64*14*14_BR-(1)4dc2s_S
         with tf.variable_scope("discriminator", reuse=reuse):
@@ -62,7 +182,28 @@ class BEGAN(object):
             out = tf.nn.sigmoid(deconv2d(net, [self.batch_size, 28, 28, 1], 4, 4, 2, 2, name='d_dc5'))
 
             # recon loss
-            recon_error = tf.sqrt(2 * tf.nn.l2_loss(out - x)) / self.batch_size
+            # recon_error = tf.sqrt(2 * tf.nn.l2_loss(out - x)) / self.batch_size
+
+            # -------------
+
+            placeholderImage = tf.placeholder(tf.float32, shape=(None, 1, *(28, 28)), name="image")
+
+            Z = encode_samples(self.data_X, placeholderImage, code, sess, saver)
+            var1 = tf.placeholder(tf.float32, shape=(None, 10), name="real_images")
+
+            kmeans = KMeans(n_clusters=10, n_init=20)
+            kmeans.fit_predict(out.eval())
+            cluster = cluster_layer(code, 10, weights=kmeans.cluster_centers_)
+            gamma = 1
+            cross_entropy = -tf.reduce_sum(var1 * tf.log(cluster))
+            entropy = -tf.reduce_sum(var1 * tf.log(var1 + 0.00001))
+            Lc = cross_entropy - entropy
+
+            Lr = tf.losses.mean_squared_error(x, out)
+
+            recon_error = Lr + gamma * Lc
+            # ---------
+
             return out, recon_error, code
 
     def generator(self, z, is_training=True, reuse=False):
@@ -96,6 +237,8 @@ class BEGAN(object):
         self.z = tf.placeholder(tf.float32, [bs, self.z_dim], name='z')
 
         """ Loss Function """
+
+        saver, sess = tf.train.Saver(), tf.Session()
 
         # output of D for real images
         D_real_img, D_real_err, D_real_code = self.discriminator(self.inputs, is_training=True, reuse=False)
